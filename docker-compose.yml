@@ -1,0 +1,42 @@
+name: renovate-gerrit-rejected-label
+
+services:
+  gerrit:
+    image: gerritcodereview/gerrit:3.14.6
+    ports:
+      - 127.0.0.1::8080
+    volumes:
+      - gerrit-git:/var/gerrit/git
+      - gerrit-index:/var/gerrit/index
+      - gerrit-cache:/var/gerrit/cache
+      - gerrit-db:/var/gerrit/db
+      - gerrit-etc:/var/gerrit/etc
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/config/server/version"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  # Released Renovate. Started on demand by run.ts (profile "renovate").
+  renovate:
+    image: renovate/renovate:44.251.0
+    profiles: [renovate]
+    depends_on:
+      gerrit:
+        condition: service_healthy
+    environment:
+      RENOVATE_CONFIG_FILE: /repro/config.js
+      LOG_LEVEL: info
+      LOG_FILE: /repro/logs/${LOG_NAME:-renovate}.log
+      LOG_FILE_LEVEL: debug
+      GERRIT_URL: http://gerrit:8080/
+    volumes:
+      - ./config.js:/repro/config.js:ro
+      - ./logs:/repro/logs
+
+volumes:
+  gerrit-git:
+  gerrit-index:
+  gerrit-cache:
+  gerrit-db:
+  gerrit-etc:
