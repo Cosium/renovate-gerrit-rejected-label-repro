@@ -15,5 +15,5 @@ module.exports = {
   reviewers: ['alice'],
   // The account voting Verified becomes a reviewer of the change; it must not
   // count as a human reviewer already assigned.
-  ignoreReviewers: ['ci'],
+  ignoreReviewers: ['admin'],
 };

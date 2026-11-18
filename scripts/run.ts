@@ -1,9 +1,3 @@
-// Reproduces Renovate reading a Gerrit change with Verified -1 as a pending
-// branch status, from a clean Gerrit.
-//
-// Usage:
-//   node scripts/run.ts released                 # renovate/renovate Docker image
-//   node scripts/run.ts source <renovate-clone>  # Renovate run from source (pnpm start)
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
@@ -21,11 +15,6 @@ import { dirname, join, resolve } from 'node:path';
 type Mode =
   | { readonly kind: 'released' }
   | { readonly kind: 'source'; readonly renovateClone: string };
-
-interface Account {
-  readonly username: string;
-  readonly password: string;
-}
 
 interface LogEntry {
   readonly msg: string;
@@ -46,7 +35,7 @@ interface Change {
 }
 
 const reproDir = dirname(import.meta.dirname);
-const admin: Account = { username: 'admin', password: 'secret' };
+const admin = { username: 'admin', password: 'secret' };
 const project = 'rejected-label-demo';
 
 const parseMode = (args: readonly string[]): Mode => {
@@ -90,18 +79,14 @@ const run = (
   });
 
 const callGerrit = async <T>(
+  gerritUrl: string,
   path: string,
-  init: {
-    readonly method?: string;
-    readonly body?: unknown;
-    readonly account?: Account;
-  } = {},
+  init: { readonly method?: string; readonly body?: unknown } = {},
 ): Promise<T> => {
-  const account = init.account ?? admin;
-  const response = await fetch(`${gerrit}/a/${path}`, {
+  const response = await fetch(`${gerritUrl}/a/${path}`, {
     method: init.method ?? 'GET',
     headers: {
-      Authorization: `Basic ${Buffer.from(`${account.username}:${account.password}`).toString('base64')}`,
+      Authorization: `Basic ${Buffer.from(`${admin.username}:${admin.password}`).toString('base64')}`,
       'Content-Type': 'application/json',
     },
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
@@ -114,25 +99,23 @@ const callGerrit = async <T>(
   return JSON.parse(text.slice(text.indexOf('\n') + 1)) as T;
 };
 
-const computeLabel = (mode: Mode): string => {
+const computeLogPrefix = (mode: Mode): string => {
   if (mode.kind === 'released') {
     return 'released';
   }
-  const commit = run('git', ['rev-parse', '--short', 'HEAD'], {
-    cwd: mode.renovateClone,
-  }).trim();
-  return `source-${commit}`;
+  return `source-${run('git', ['rev-parse', '--short', 'HEAD'], { cwd: mode.renovateClone }).trim()}`;
 };
 
 const runRenovate = (
+  gerritUrl: string,
   mode: Mode,
-  label: string,
-  renovateRun: number,
-  renovate: Account,
-  work: string,
+  logPrefix: string,
+  renovateRunNumber: number,
+  renovatePassword: string,
+  workDirectory: string,
 ): void => {
-  const name = `${label}-run${renovateRun}`;
-  log(`Renovate run ${renovateRun} (${label}), log: logs/${name}.log`);
+  const name = `${logPrefix}-run${renovateRunNumber}`;
+  log(`Renovate run ${renovateRunNumber} (${logPrefix}), log: logs/${name}.log`);
   rmSync(join(reproDir, 'logs', `${name}.log`), { force: true });
   if (mode.kind === 'released') {
     run(
@@ -141,9 +124,8 @@ const runRenovate = (
         'compose',
         'run',
         '--rm',
-        '--no-deps',
         '-e',
-        `RENOVATE_GERRIT_PASSWORD=${renovate.password}`,
+        `RENOVATE_GERRIT_PASSWORD=${renovatePassword}`,
         'renovate',
       ],
       { env: { LOG_NAME: name } },
@@ -156,11 +138,11 @@ const runRenovate = (
     cwd: mode.renovateClone,
     env: buildEnvironment({
       RENOVATE_CONFIG_FILE: join(reproDir, 'config.js'),
-      RENOVATE_GERRIT_PASSWORD: renovate.password,
-      GERRIT_URL: `${gerrit}/`,
+      RENOVATE_GERRIT_PASSWORD: renovatePassword,
+      GERRIT_URL: `${gerritUrl}/`,
       LOG_LEVEL: 'debug',
       LOG_FORMAT: 'json',
-      RENOVATE_BASE_DIR: join(work, `renovate-run${renovateRun}`),
+      RENOVATE_BASE_DIR: join(workDirectory, `renovate-run${renovateRunNumber}`),
     }),
     stdio: [
       'ignore',
@@ -170,8 +152,9 @@ const runRenovate = (
   });
 };
 
-const findRenovateChange = async (): Promise<Change> => {
+const findRenovateChange = async (gerritUrl: string): Promise<Change> => {
   const changes = await callGerrit<readonly Change[]>(
+    gerritUrl,
     `changes/?q=owner:renovate+status:open+project:${project}&o=LABELS&o=DETAILED_LABELS&o=DETAILED_ACCOUNTS&o=SUBMITTABLE&o=SUBMIT_REQUIREMENTS`,
   );
   const [change] = changes;
@@ -189,22 +172,11 @@ const printChange = (change: Change): void => {
   console.log(`  reviewers: ${JSON.stringify(listReviewers(change))}`);
 };
 
-const parseLogEntry = (line: string): LogEntry | undefined => {
-  try {
-    return JSON.parse(line) as LogEntry;
-  } catch {
-    return undefined;
-  }
-};
-
-const printBranchStatusDecisions = (label: string): void => {
-  const logName = `logs/${label}-run2.log`;
-  log(`Branch status and reviewer decisions of run 2 (${logName})`);
+const readBranchStatusDecisions = (logName: string): readonly string[] => {
   const messages = readFileSync(join(reproDir, logName), 'utf8')
     .split('\n')
-    .map(parseLogEntry)
-    .filter((entry) => entry !== undefined)
-    .map((entry) => entry.msg)
+    .filter((line) => line !== '')
+    .map((line) => (JSON.parse(line) as LogEntry).msg)
     .filter((message) =>
       /^(Branch status |Setting assignees and reviewers|PR is not ready for merge)/.test(
         message,
@@ -215,9 +187,7 @@ const printBranchStatusDecisions = (label: string): void => {
       `No branch status in ${logName}: Renovate stopped early, see that log`,
     );
   }
-  for (const message of messages) {
-    console.log(`  ${message}`);
-  }
+  return messages;
 };
 
 // Gerrit listens on a port Docker picks, so another service on 8080 is no obstacle.
@@ -229,10 +199,9 @@ const startCleanGerrit = (): string => {
     console.trace('Stopping a previous Gerrit failed', error);
   }
   run('docker', ['compose', 'up', '-d', '--wait', 'gerrit']);
-  const address = run('docker', ['compose', 'port', 'gerrit', '8080']).trim();
-  const url = `http://${address}`;
-  console.log(`Gerrit is on ${url}`);
-  return url;
+  const gerritUrl = `http://${run('docker', ['compose', 'port', 'gerrit', '8080']).trim()}`;
+  console.log(`Gerrit is on ${gerritUrl}`);
+  return gerritUrl;
 };
 
 const prepareLogDirectory = (): void => {
@@ -242,9 +211,12 @@ const prepareLogDirectory = (): void => {
   chmodSync(logs, 0o777);
 };
 
-const createAccount = async (username: string): Promise<Account> => {
+const createAccount = async (
+  gerritUrl: string,
+  username: string,
+): Promise<string> => {
   const password = randomBytes(18).toString('base64');
-  await callGerrit(`accounts/${username}`, {
+  await callGerrit(gerritUrl, `accounts/${username}`, {
     method: 'PUT',
     body: {
       name: username,
@@ -252,18 +224,21 @@ const createAccount = async (username: string): Promise<Account> => {
       http_password: password,
     },
   });
-  return { username, password };
+  return password;
 };
 
-const createProject = async (work: string): Promise<void> => {
+const createProject = async (
+  gerritUrl: string,
+  workDirectory: string,
+): Promise<void> => {
   log(`Creating project ${project} with a Verified label and submit requirement`);
-  await callGerrit(`projects/${project}`, {
+  await callGerrit(gerritUrl, `projects/${project}`, {
     method: 'PUT',
     body: { branches: ['master'], create_empty_commit: true },
   });
   // A label as Gerrit documents it since submit requirements replaced label
   // functions: NoBlock, its veto expressed by the submit requirement.
-  await callGerrit(`projects/${project}/labels/Verified`, {
+  await callGerrit(gerritUrl, `projects/${project}/labels/Verified`, {
     method: 'PUT',
     body: {
       function: 'NoBlock',
@@ -271,7 +246,7 @@ const createProject = async (work: string): Promise<void> => {
       commit_message: 'Add the Verified label',
     },
   });
-  await callGerrit(`projects/${project}/submit_requirements/Verified`, {
+  await callGerrit(gerritUrl, `projects/${project}/submit_requirements/Verified`, {
     method: 'PUT',
     body: {
       name: 'Verified',
@@ -280,21 +255,20 @@ const createProject = async (work: string): Promise<void> => {
       commit_message: 'Add the Verified submit requirement',
     },
   });
-  const ciGroup = await callGerrit<{ readonly id: string }>('groups/CI', {
-    method: 'PUT',
-    body: { members: ['ci'] },
-  });
   const administrators = await callGerrit<{ readonly id: string }>(
+    gerritUrl,
     'groups/Administrators',
   );
-  await callGerrit(`projects/${project}/access`, {
+  await callGerrit(gerritUrl, `projects/${project}/access`, {
     method: 'POST',
     body: {
       add: {
         'refs/heads/*': {
           permissions: {
             'label-Verified': {
-              rules: { [ciGroup.id]: { action: 'ALLOW', min: -1, max: 1 } },
+              rules: {
+                [administrators.id]: { action: 'ALLOW', min: -1, max: 1 },
+              },
             },
             push: { rules: { [administrators.id]: { action: 'ALLOW' } } },
           },
@@ -302,11 +276,11 @@ const createProject = async (work: string): Promise<void> => {
       },
     },
   });
-  const seed = join(work, 'seed');
+  const seed = join(workDirectory, 'seed');
   run('git', [
     'clone',
     '--quiet',
-    `${gerrit.replace('://', '://admin:secret@')}/a/${project}`,
+    `${gerritUrl.replace('://', `://${admin.username}:${admin.password}@`)}/a/${project}`,
     seed,
   ]);
   cpSync(join(reproDir, 'project'), seed, { recursive: true });
@@ -333,29 +307,28 @@ const createProject = async (work: string): Promise<void> => {
 };
 
 const mode = parseMode(process.argv.slice(2));
-const label = computeLabel(mode);
-const work = mkdtempSync(join(tmpdir(), 'rejected-label-'));
-const gerrit = startCleanGerrit();
+const logPrefix = computeLogPrefix(mode);
+const workDirectory = mkdtempSync(join(tmpdir(), 'rejected-label-'));
+const gerritUrl = startCleanGerrit();
 try {
   prepareLogDirectory();
-  log('Creating users renovate, alice (reviewer) and ci (votes Verified)');
-  const renovate = await createAccount('renovate');
-  await createAccount('alice');
-  const ci = await createAccount('ci');
-  await createProject(work);
+  log('Creating users renovate and alice (reviewer)');
+  const renovatePassword = await createAccount(gerritUrl, 'renovate');
+  await createAccount(gerritUrl, 'alice');
+  await createProject(gerritUrl, workDirectory);
 
-  runRenovate(mode, label, 1, renovate, work);
+  runRenovate(gerritUrl, mode, logPrefix, 1, renovatePassword, workDirectory);
   log('Change after run 1 (automerge: no reviewer while the checks are pending)');
-  const created = await findRenovateChange();
+  const created = await findRenovateChange(gerritUrl);
   printChange(created);
 
-  log('ci votes Verified -1 (the build of the change failed)');
-  await callGerrit(`changes/${created._number}/revisions/current/review`, {
-    method: 'POST',
-    body: { labels: { Verified: -1 } },
-    account: ci,
-  });
-  const failed = await findRenovateChange();
+  log('admin votes Verified -1 (the build of the change failed)');
+  await callGerrit(
+    gerritUrl,
+    `changes/${created._number}/revisions/current/review`,
+    { method: 'POST', body: { labels: { Verified: -1 } } },
+  );
+  const failed = await findRenovateChange(gerritUrl);
   const verified = failed.labels?.Verified ?? {};
   console.log(
     `  labels.Verified: rejected ${'rejected' in verified ? 'set' : 'absent'}, blocking ${'blocking' in verified ? 'set' : 'absent'}`,
@@ -365,16 +338,25 @@ try {
     console.log(`  submit requirement ${requirement.name}: ${requirement.status}`);
   }
 
-  runRenovate(mode, label, 2, renovate, work);
-  printBranchStatusDecisions(label);
+  runRenovate(gerritUrl, mode, logPrefix, 2, renovatePassword, workDirectory);
+  const logName = `logs/${logPrefix}-run2.log`;
+  log(`Branch status and reviewer decisions of run 2 (${logName})`);
+  const decisions = readBranchStatusDecisions(logName);
+  for (const decision of decisions) {
+    console.log(`  ${decision}`);
+  }
   log('Change after run 2');
-  const reviewers = listReviewers(await findRenovateChange());
-  console.log(`  reviewers: ${JSON.stringify(reviewers)}`);
-  if (reviewers.includes('alice')) {
-    log('Not reproduced: Renovate added alice to the failed change');
+  console.log(
+    `  reviewers: ${JSON.stringify(listReviewers(await findRenovateChange(gerritUrl)))}`,
+  );
+  if (decisions.includes('Branch status red')) {
+    log('Not reproduced: the failed change has a red branch status');
+  } else if (decisions.includes('Branch status yellow')) {
+    log('Reproduced: the failed change has a yellow branch status');
+    process.exitCode = 1;
   } else {
-    log('Reproduced: Renovate did not add alice to the failed change');
+    throw new Error(`Unexpected branch status in ${logName}`);
   }
 } finally {
-  rmSync(work, { recursive: true, force: true });
+  rmSync(workDirectory, { recursive: true, force: true });
 }

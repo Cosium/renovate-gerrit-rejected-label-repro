@@ -16,15 +16,16 @@ Proposed fix: https://github.com/renovatebot/renovate/pull/48020
 Gerrit marks a vote at the label's minimum value as `rejected` in the change's
 `labels`. It sets `blocking` only for the deprecated `MaxWithBlock` and
 `AnyWithBlock` label functions. Renovate's Gerrit `getBranchStatus` returns
-`red` only for a `blocking` label, so with a `NoBlock` label the failed change
-is not submittable, not blocking, and reads as `yellow`.
+`red` only for a consistency problem of the change or a `blocking` label, so
+with a `NoBlock` label the failed change is not submittable, not blocking, and
+reads as `yellow`.
 
 ## Reproduction
 
 Prerequisites: Docker with Compose v2, git, Node.js 24 or later (it runs the
 TypeScript scripts directly). To run Renovate from source, also a Renovate
-checkout with its dependencies installed (`pnpm install`). `RENOVATE_*` variables of your shell
-are not passed to Renovate.
+checkout with its dependencies installed (`pnpm install`). `RENOVATE_*`
+variables of your shell are not passed to Renovate.
 
 ```sh
 node scripts/run.ts released                 # renovate/renovate:44.251.0
@@ -35,28 +36,48 @@ docker compose down -v                       # clean up
 Each invocation takes about 30 seconds once the images are pulled. It starts a
 fresh Gerrit 3.14.6 (development auth, default `admin`/`secret`) and then:
 
-1. creates the users `renovate`, `alice` and `ci`, and the project
+1. creates the users `renovate` and `alice`, and the project
    `rejected-label-demo` with an outdated `package.json`, a `Verified` label
-   (`NoBlock`, -1..+1, voted by `ci`) and a `Verified` submit requirement
-   (`label:Verified=MAX AND -label:Verified=MIN`);
+   and a `Verified` submit requirement. Its `project.config` (on
+   `refs/meta/config`) ends up as:
+
+   ```ini
+   [access]
+   	inheritFrom = All-Projects
+   [submit]
+   	action = inherit
+   [label "Verified"]
+   	function = NoBlock
+   	defaultValue = 0
+   	value = -1 Fails
+   	value = 0 No score
+   	value = +1 Verified
+   [access "refs/heads/*"]
+   	label-Verified = -1..+1 group Administrators
+   	push = group Administrators
+   [submit-requirement "Verified"]
+   	submittableIf = label:Verified=MAX AND -label:Verified=MIN
+   	canOverrideInChildProjects = false
+   ```
+
 2. Renovate run 1 creates a change for `is-number`. With `automerge: true` and
    `assignAutomerge: false`, it adds no reviewer while the checks are pending;
-3. `ci` votes `Verified -1` on the change, as a CI account does when the build
-   fails. Any account allowed to vote `Verified -1` gives the same state;
+3. `admin` votes `Verified -1` on the change, as CI does when the build fails.
+   Any account allowed to vote `Verified -1` gives the same state;
 4. Renovate run 2 processes the existing change. It should see a `red` status
-   and add `alice` as a reviewer. `ci` became a reviewer by voting, so it is in
-   `ignoreReviewers`.
+   and add `alice` as a reviewer. `admin` became a reviewer by voting, so it is
+   in `ignoreReviewers`.
 
-Renovate logs (debug) go to `logs/`. The script ends with `Reproduced` or
-`Not reproduced`, and fails if Renovate stopped before reading the branch
-status.
+Renovate logs (debug) go to `logs/`. The script ends with `Reproduced` (exit
+code 1) or `Not reproduced` (exit code 0), decided by the branch status Renovate
+logs in run 2, and fails if Renovate stopped before reading it.
 
 ## Current behavior
 
 Output with Renovate 44.251.0:
 
 ```
-==> ci votes Verified -1 (the build of the change failed)
+==> admin votes Verified -1 (the build of the change failed)
   labels.Verified: rejected set, blocking absent
   submittable: false
   submit requirement Verified: UNSATISFIED
@@ -69,15 +90,18 @@ Output with Renovate 44.251.0:
   PR is not ready for merge (branch status is yellow)
 
 ==> Change after run 2
-  reviewers: ["ci"]
+  reviewers: ["admin"]
 
-==> Reproduced: Renovate did not add alice to the failed change
+==> Reproduced: the failed change has a yellow branch status
 ```
+
+Renovate run from source on `main` (`7efa9732eb`) gives the same branch status
+and reviewers.
 
 ## Expected behavior
 
 The branch status is `red` and Renovate adds `alice`. Output with the proposed
-fix:
+fix (`259e32acd3`, run from source):
 
 ```
 ==> Branch status and reviewer decisions of run 2 (logs/source-259e32acd3-run2.log)
@@ -87,9 +111,9 @@ fix:
   PR is not ready for merge (branch status is red)
 
 ==> Change after run 2
-  reviewers: ["alice","ci"]
+  reviewers: ["admin","alice"]
 
-==> Not reproduced: Renovate added alice to the failed change
+==> Not reproduced: the failed change has a red branch status
 ```
 
 The output also shows why unsatisfied submit requirements cannot stand for
